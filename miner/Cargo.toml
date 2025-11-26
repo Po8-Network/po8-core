@@ -1,0 +1,13 @@
+[package]
+name = "po8-miner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+po8-consensus = { path = "../consensus" }
+po8-crypto = { path = "../crypto" }
+libc = "0.2"
+sha3 = "0.10"
+
+[build-dependencies]
+cc = "1.0"

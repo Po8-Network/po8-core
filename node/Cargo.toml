@@ -1,0 +1,16 @@
+[package]
+name = "po8-node"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+po8-consensus = { path = "../consensus" }
+po8-crypto = { path = "../crypto" }
+po8-miner = { path = "../miner" }
+po8-vm = { path = "../vm" }
+tokio = { version = "1.0", features = ["full"] }
+warp = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"
+sha3 = "0.10"

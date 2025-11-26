@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "consensus",
+    "vm",
+    "crypto",
+    "miner",
+    "node",
+]
+resolver = "2"
