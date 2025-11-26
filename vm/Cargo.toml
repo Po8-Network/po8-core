@@ -5,7 +5,5 @@ edition = "2021"
 
 [dependencies]
 po8-crypto = { path = "../crypto" }
-# We need to access sub-crates directly if top-level re-exports are missing/confusing
-revm = { version = "25.0.0", features = ["std", "optional_balance_check"] }
-revm-primitives = "19.2.0" 
-revm-database = "5.0.0"
+revm = { version = "19.0.0", features = ["std", "optional_balance_check"] }
+hex = "0.4"

@@ -57,6 +57,8 @@ struct QuantumTransaction {
     amount: String,    // String number
     nonce: u64,
     signature: String, // Hex encoded ML-DSA-65 Signature
+    #[serde(default)]
+    data: Option<String>, // Hex encoded data (optional)
 }
 
 #[tokio::main]
@@ -158,11 +160,11 @@ async fn main() {
                 "net_version" => {
                     response.result = Some(serde_json::json!(network.chain_id()));
                 },
-                "get_block_count" => {
+                "get_block_count" | "eth_blockNumber" => {
                     let lock = engine.lock().unwrap();
                     response.result = Some(serde_json::json!(lock.chain.len()));
                 },
-                "get_balance" => {
+                "get_balance" | "eth_getBalance" => {
                     // If address param provided, use it, else dummy default
                     let addr = if let Some(a) = req.params.get(0).and_then(|v| v.as_str()) {
                         a.to_string()
@@ -172,7 +174,7 @@ async fn main() {
 
                     let lock = vm.lock().unwrap();
                     match lock.get_balance(addr) {
-                        Ok(bal) => response.result = Some(serde_json::json!(bal.to_string())),
+                        Ok(bal) => response.result = Some(serde_json::json!(format!("0x{:x}", bal))), // Hex for eth_getBalance
                         Err(e) => response.error = Some(e),
                     }
                 },
@@ -246,8 +248,9 @@ async fn main() {
                              let pk_bytes = hex::decode(&qtx.sender_pk).unwrap_or_default();
                              let sig_bytes = hex::decode(&qtx.signature).unwrap_or_default();
                              
-                             // Reconstruct message: recipient:amount:nonce (Simple serialization for MVP)
-                             let msg = format!("{}:{}:{}", qtx.recipient, qtx.amount, qtx.nonce);
+                             // Reconstruct message: recipient:amount:nonce:data
+                             let data_str = qtx.data.clone().unwrap_or_default();
+                             let msg = format!("{}:{}:{}:{}", qtx.recipient, qtx.amount, qtx.nonce, data_str);
                              let msg_bytes = msg.as_bytes();
 
                              if let Ok(valid) = MlDsa65::verify(msg_bytes, &sig_bytes, &pk_bytes) {
@@ -266,9 +269,10 @@ async fn main() {
                                      let mut vm_lock = vm.lock().unwrap();
                                      
                                      // Mint gas/funds if needed for Devnet
-                                     let _ = vm_lock.mint(sender_addr_fmt.clone(), amount + 1000); 
+                                     let _ = vm_lock.mint(sender_addr_fmt.clone(), amount + 1000000000000000000); // Mint extra for gas
 
-                                     match vm_lock.execute_transaction(sender_addr_fmt, qtx.recipient.clone(), amount, vec![]) {
+                                     let data_bytes = hex::decode(&data_str).unwrap_or_default();
+                                     match vm_lock.execute_transaction(sender_addr_fmt, qtx.recipient.clone(), amount, data_bytes) {
                                          Ok(res) => response.result = Some(serde_json::json!(res)),
                                          Err(e) => response.error = Some(e),
                                      }
