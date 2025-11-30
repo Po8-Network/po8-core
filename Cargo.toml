@@ -5,5 +5,6 @@ members = [
     "crypto",
     "miner",
     "node",
+    "load-tester",
 ]
 resolver = "2"

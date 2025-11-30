@@ -166,3 +166,52 @@ impl HybridKEM {
         Ok(session_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mldsa65_signing() {
+        let keypair = MlDsa65::generate_keypair().unwrap();
+        let message = b"Hello Quantum World";
+        
+        // Sign
+        let signature = MlDsa65::sign(message, &keypair.secret_key).unwrap();
+        
+        // Verify
+        let valid = MlDsa65::verify(message, &signature, &keypair.public_key).unwrap();
+        assert!(valid, "Signature should be valid");
+
+        // Verify failure on wrong message
+        let valid_wrong = MlDsa65::verify(b"Wrong Message", &signature, &keypair.public_key).unwrap();
+        assert!(!valid_wrong, "Signature should be invalid for wrong message");
+    }
+
+    #[test]
+    fn test_hybrid_kem() {
+        // Alice generates keys
+        let alice_keys = HybridKEM::generate_keypair().unwrap();
+
+        // Bob generates keys (for his X25519 identity in this context, though encap only needs Alice's PK)
+        let bob_x25519_sk = x25519_dalek::StaticSecret::random_from_rng(OsRng);
+        let bob_x25519_pk = X25519PublicKey::from(&bob_x25519_sk);
+
+        // Bob encapsulates to Alice
+        let alice_x25519_pk_arr: [u8; 32] = alice_keys.x25519_pk.try_into().unwrap();
+        let (ciphertext, bob_shared_secret) = HybridKEM::encapsulate(
+            &alice_x25519_pk_arr, 
+            &alice_keys.mlkem_pk
+        ).unwrap();
+
+        // Alice decapsulates
+        let alice_x25519_sk_arr: [u8; 32] = alice_keys.x25519_sk.try_into().unwrap();
+        let alice_shared_secret = HybridKEM::decapsulate(
+            &ciphertext,
+            &alice_x25519_sk_arr,
+            &alice_keys.mlkem_sk
+        ).unwrap();
+
+        assert_eq!(bob_shared_secret, alice_shared_secret, "Shared secrets should match");
+    }
+}

@@ -1,0 +1,74 @@
+warning: unused import: `SignedMessage`
+ --> crypto/src/lib.rs:2:102
+  |
+2 | use pqcrypto_traits::sign::{DetachedSignature, PublicKey as SigPublicKey, SecretKey as SigSecretKey, SignedMessage};
+  |                                                                                                      ^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused variable: `x_public`
+  --> crypto/src/lib.rs:93:13
+   |
+93 |         let x_public = X25519PublicKey::from(&x_secret);
+   |             ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_x_public`
+   |
+   = note: `#[warn(unused_variables)]` on by default
+
+warning: `po8-crypto` (lib) generated 2 warnings
+warning: po8-miner@0.1.0: In file included from src/mlx_bridge.cpp:10:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/mlx.h:5:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/array.h:11:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/dtype.h:8:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/types/complex.h:5:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/types/half_types.h:30:
+warning: po8-miner@0.1.0: /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/types/bf16.h:28:3: warning: definition of implicit copy assignment operator for '_MLX_BFloat16' is deprecated because it has a user-declared copy constructor [-Wdeprecated-copy]
+warning: po8-miner@0.1.0:    28 |   _MLX_BFloat16(_MLX_BFloat16 const&) = default;
+warning: po8-miner@0.1.0:       |   ^
+warning: po8-miner@0.1.0: /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/types/bf16.h:37:19: note: in implicit copy assignment operator for 'mlx::core::_MLX_BFloat16' first required here
+warning: po8-miner@0.1.0:    37 |     return (*this = _MLX_BFloat16(x));
+warning: po8-miner@0.1.0:       |                   ^
+warning: po8-miner@0.1.0: In file included from src/mlx_bridge.cpp:10:
+warning: po8-miner@0.1.0: In file included from /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/mlx.h:17:
+warning: po8-miner@0.1.0: /Users/altninja/anaconda3/lib/python3.11/site-packages/mlx/include/mlx/random.h:91:20: warning: unused parameter 's' [-Wunused-parameter]
+warning: po8-miner@0.1.0:    91 |     StreamOrDevice s = {}) {
+warning: po8-miner@0.1.0:       |                    ^
+warning: po8-miner@0.1.0: 2 warnings generated.
+warning: unused import: `revm::precompile::Precompiles`
+ --> vm/src/lib.rs:9:5
+  |
+9 | use revm::precompile::Precompiles;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` on by default
+
+warning: unused import: `revm::ContextPrecompiles`
+  --> vm/src/lib.rs:10:5
+   |
+10 | use revm::ContextPrecompiles; // Assuming this exists or similar
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `po8-vm` (lib) generated 2 warnings (run `cargo fix --lib -p po8-vm` to apply 2 suggestions)
+warning: unused variable: `tx_data`
+   --> node/src/main.rs:285:45
+    |
+285 |                          } else if let Some(tx_data) = tx_json.as_str() {
+    |                                             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_tx_data`
+    |
+    = note: `#[warn(unused_variables)]` on by default
+
+warning: `po8-node` (bin "po8-node") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.39s
+     Running `target/debug/po8-node`
+Starting Po8 Node on Network: Development (ChainID: 1337)
+Node Identity (ML-DSA-65 Public Key size: 1952 bytes)
+Miner Address: 0x7a3e4f1a3d23b9c8efc16209548ebf2d6e6e9215
+P2P Identity Generated:
+  X25519 PK: [16, 6f, 1e, d6, 5f, 7b, 73, 85]
+  ML-KEM PK Size: 1184
+JSON-RPC listening on http://127.0.0.1:8833/rpc
+Node Dashboard available at http://127.0.0.1:8833/
+P2P Listener started on port 8834
+Mined Block 1! Nonce: 180, Proof: [00, 80, 40, a0]...
+Proposer not in validator set
+Consensus: Block 1 verification failed.
+Chain updated. Height: 1

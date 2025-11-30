@@ -7,3 +7,6 @@ edition = "2021"
 po8-crypto = { path = "../crypto" }
 revm = { version = "19.0.0", features = ["std", "optional_balance_check"] }
 hex = "0.4"
+
+[dev-dependencies]
+sha3 = "0.10"
