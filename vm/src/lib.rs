@@ -7,9 +7,10 @@ use revm::primitives::{Address, U256, ExecutionResult, Output, TransactTo, Bytes
 use revm::db::{CacheDB, EmptyDB, Database};
 use revm::Evm;
 use revm::precompile::Precompiles;
-use revm::ContextPrecompiles; // Assuming this exists or similar
+use revm::ContextPrecompiles; 
 use hex;
 use po8_crypto::{MlDsa65, QuantumSigner};
+use serde::{Serialize, Deserialize};
 
 pub struct EvmEngine {
     // In-memory database for EVM state (accounts, code, storage)
@@ -20,6 +21,22 @@ impl EvmEngine {
     pub fn new() -> Self {
         let db = Arc::new(Mutex::new(CacheDB::new(EmptyDB::default())));
         Self { db }
+    }
+
+    pub fn load_from_disk(path: &str) -> Result<Self, String> {
+        if !std::path::Path::new(path).exists() {
+             return Ok(Self::new());
+        }
+        let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+        let db: CacheDB<EmptyDB> = serde_json::from_reader(file).map_err(|e| e.to_string())?;
+        Ok(Self { db: Arc::new(Mutex::new(db)) })
+    }
+
+    pub fn save_to_disk(&self, path: &str) -> Result<(), String> {
+        let db = self.db.lock().unwrap();
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        serde_json::to_writer(file, &*db).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub fn execute_transaction(
@@ -78,6 +95,109 @@ impl EvmEngine {
             ExecutionResult::Halt { reason, .. } => {
                 Err(format!("Halted: {:?}", reason))
             }
+        }
+    }
+
+    pub fn call(
+        &mut self,
+        caller: String,
+        to: String,
+        value_wei: u128,
+        data: Vec<u8>,
+    ) -> Result<String, String> {
+        let caller_addr = Address::from_str(&caller).map_err(|_| "Invalid caller address")?;
+        let to_addr = if to.is_empty() || to == "0x" {
+            None
+        } else {
+            Some(Address::from_str(&to).map_err(|_| "Invalid to address")?)
+        };
+        let value = U256::from(value_wei);
+
+        // Lock DB
+        let mut db_guard = self.db.lock().unwrap();
+        
+        let mut evm = Evm::builder()
+            .with_db(&mut *db_guard)
+            .append_handler_register(handle_register)
+            .modify_tx_env(|tx| {
+                tx.caller = caller_addr;
+                tx.transact_to = if let Some(addr) = to_addr {
+                    TransactTo::Call(addr)
+                } else {
+                    TransactTo::Create
+                };
+                tx.value = value;
+                tx.data = data.into();
+                tx.gas_limit = 10_000_000;
+                tx.gas_price = U256::from(1);
+            })
+            .build();
+
+        // Execute without commit
+        let result = evm.transact().map_err(|e| format!("EVM Error: {:?}", e))?;
+        
+        match result.result {
+            ExecutionResult::Success { output, .. } => {
+                match output {
+                    Output::Call(bytes) => Ok(hex::encode(bytes)),
+                    Output::Create(bytes, addr) => {
+                         if let Some(address) = addr {
+                             Ok(format!("Contract Created at {:?} (Output: {})", address, hex::encode(bytes)))
+                         } else {
+                             Ok(format!("Contract Created (Output: {})", hex::encode(bytes)))
+                         }
+                    }
+                }
+            },
+            ExecutionResult::Revert { output, .. } => {
+                Err(format!("Reverted: {}", hex::encode(output)))
+            },
+            ExecutionResult::Halt { reason, .. } => {
+                Err(format!("Halted: {:?}", reason))
+            }
+        }
+    }
+
+    pub fn estimate_gas(
+        &mut self,
+        caller: String,
+        to: String,
+        value_wei: u128,
+        data: Vec<u8>,
+    ) -> Result<u64, String> {
+        let caller_addr = Address::from_str(&caller).map_err(|_| "Invalid caller address")?;
+        let to_addr = if to.is_empty() || to == "0x" {
+            None
+        } else {
+            Some(Address::from_str(&to).map_err(|_| "Invalid to address")?)
+        };
+        let value = U256::from(value_wei);
+
+        let mut db_guard = self.db.lock().unwrap();
+        
+        let mut evm = Evm::builder()
+            .with_db(&mut *db_guard)
+            .append_handler_register(handle_register)
+            .modify_tx_env(|tx| {
+                tx.caller = caller_addr;
+                tx.transact_to = if let Some(addr) = to_addr {
+                    TransactTo::Call(addr)
+                } else {
+                    TransactTo::Create
+                };
+                tx.value = value;
+                tx.data = data.into();
+                tx.gas_limit = 10_000_000; 
+                tx.gas_price = U256::from(1);
+            })
+            .build();
+
+        let result = evm.transact().map_err(|e| format!("EVM Error: {:?}", e))?;
+        
+        match result.result {
+            ExecutionResult::Success { gas_used, .. } => Ok(gas_used),
+            ExecutionResult::Revert { gas_used, .. } => Ok(gas_used),
+            ExecutionResult::Halt { .. } => Err("Transaction Halted during estimation".to_string()),
         }
     }
 

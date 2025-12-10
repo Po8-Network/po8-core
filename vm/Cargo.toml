@@ -5,8 +5,10 @@ edition = "2021"
 
 [dependencies]
 po8-crypto = { path = "../crypto" }
-revm = { version = "19.0.0", features = ["std", "optional_balance_check"] }
+revm = { version = "19.0.0", features = ["std", "optional_balance_check", "serde"] }
 hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 
 [dev-dependencies]
 sha3 = "0.10"

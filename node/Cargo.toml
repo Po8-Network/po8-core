@@ -14,3 +14,6 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 hex = "0.4"
 sha3 = "0.10"
+base64 = "0.21"
+chacha20poly1305 = "0.10"
+rand = "0.8"
