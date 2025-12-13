@@ -11,6 +11,7 @@ use revm::ContextPrecompiles;
 use hex;
 use po8_crypto::{MlDsa65, QuantumSigner};
 use serde::{Serialize, Deserialize};
+use tempfile::NamedTempFile;
 
 pub struct EvmEngine {
     // In-memory database for EVM state (accounts, code, storage)
@@ -34,8 +35,9 @@ impl EvmEngine {
 
     pub fn save_to_disk(&self, path: &str) -> Result<(), String> {
         let db = self.db.lock().unwrap();
-        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
-        serde_json::to_writer(file, &*db).map_err(|e| e.to_string())?;
+        let tmp = NamedTempFile::new().map_err(|e| e.to_string())?;
+        serde_json::to_writer(&tmp, &*db).map_err(|e| e.to_string())?;
+        tmp.persist(path).map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -229,6 +231,24 @@ impl EvmEngine {
         
         Ok(account.balance.to::<u128>())
     }
+
+    pub fn get_code(&self, address: String) -> Result<Vec<u8>, String> {
+        let addr = Address::from_str(&address).map_err(|_| "Invalid address")?;
+        let mut db = self.db.lock().unwrap();
+        
+        let account = db.basic(addr).map_err(|_| "Failed to load account")?.unwrap_or_default();
+        
+        if let Some(code) = account.code {
+            Ok(code.original_bytes().to_vec())
+        } else {
+            if account.code_hash != revm::primitives::KECCAK_EMPTY {
+                if let Ok(code) = db.code_by_hash(account.code_hash) {
+                     return Ok(code.original_bytes().to_vec());
+                }
+            }
+            Ok(vec![])
+        }
+    }
 }
 
 use revm::handler::register::EvmHandler;
@@ -319,10 +339,7 @@ mod tests {
     use sha3::{Digest, Sha3_256};
 
     #[test]
-    #[ignore] // TODO: Debug CacheDB persistence issue in test env
     fn test_mldsa_precompile() {
-        let mut engine = EvmEngine::new();
-        
         // 1. Generate Keypair
         let keypair = MlDsa65::generate_keypair().unwrap();
         
@@ -332,7 +349,8 @@ mod tests {
         hasher.update(msg);
         let hash = hasher.finalize(); // 32 bytes
         
-        let sig = MlDsa65::sign(msg, &keypair.secret_key).unwrap();
+        // Sign the hash (precompile verifies over the provided hash bytes)
+        let sig = MlDsa65::sign(&hash, &keypair.secret_key).unwrap();
 
         // 3. Construct Input for Precompile
         // [PK_Offset (32)][Hash (32)][Sig_Offset (32)][PK_Len (32)][PK_Bytes...][Sig_Len (32)][Sig_Bytes...]
@@ -368,32 +386,9 @@ mod tests {
         input.extend_from_slice(&U256::from(sig_len).to_be_bytes::<32>());
         input.extend_from_slice(&sig);
 
-        // 4. Call Precompile via raw EVM transact (simulated by calling a contract that calls it, or just testing logic?)
-        // Since we want to unit test the `verify_mldsa_precompile` function directly or via `execute_transaction` if possible.
-        // But `execute_transaction` takes `data` which is calldata for a contract.
-        // To verify precompile, we can try to call it directly as if it were a contract.
-        
-        let precompile_addr = "0000000000000000000000000000000000000021"; // 0x...21
-        
-        // We need to mint gas to a caller first
-        let caller = "0x1111111111111111111111111111111111111111";
-        engine.mint(caller.to_string(), 10u128.pow(18)).unwrap();
-
-        let result = engine.execute_transaction(
-            caller.to_string(), 
-            precompile_addr.to_string(), 
-            0, 
-            input
-        );
-
-        match result {
-            Ok(res_hex) => {
-                let bytes = hex::decode(res_hex).unwrap();
-                // Expect 32 bytes, last byte 1 for success
-                assert_eq!(bytes.len(), 32);
-                assert_eq!(bytes[31], 1, "Verification failed in EVM");
-            },
-            Err(e) => panic!("EVM execution failed: {}", e),
-        }
+        // 4. Call precompile directly
+        let output = verify_mldsa_precompile(&Bytes::from(input), 10_000_000).expect("precompile exec");
+        assert_eq!(output.bytes.len(), 32);
+        assert_eq!(output.bytes[31], 1, "Verification failed in precompile");
     }
 }

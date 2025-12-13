@@ -10,6 +10,8 @@ use rand::RngCore;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
 
+pub mod sphinx;
+
 pub const MAX_FRAME: usize = 64 * 1024;
 
 pub struct P2PServer {
@@ -99,6 +101,7 @@ impl P2PServer {
 
         // --- Encrypted Framing Loop ---
         let cipher = ChaCha20Poly1305::new(Key::from_slice(&session_key));
+        let mut frames_seen = 0u64;
         loop {
             let mut len_buf = [0u8; 4];
             if socket.read_exact(&mut len_buf).await.is_err() {
@@ -119,6 +122,11 @@ impl P2PServer {
             let ciphertext = &buf[12..];
             if let Ok(plaintext) = cipher.decrypt(nonce, ciphertext) {
                 let _ = inbound.send(plaintext);
+            }
+            frames_seen += 1;
+            if frames_seen > 1000 {
+                // Avoid unbounded resource use per connection
+                break;
             }
         }
 

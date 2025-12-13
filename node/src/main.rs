@@ -1,5 +1,5 @@
 use po8_crypto::{MlDsa65, QuantumSigner};
-use po8_consensus::ConsensusEngine;
+use po8_consensus::{ConsensusEngine, compute_block_hash, compute_txs_merkle, derive_address};
 use po8_vm::EvmEngine;
 use std::sync::{Arc, Mutex};
 use warp::Filter;
@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use rand::RngCore;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
+use serde::{Serialize, Deserialize};
 
 mod p2p; // Import P2P module
 
@@ -196,10 +197,17 @@ fn process_relay(relay: RelayPacket, messages: &Arc<Mutex<MessageStore>>, peers:
 }
 
 #[derive(serde::Serialize)]
+struct RpcError {
+    code: i32,
+    message: String,
+    data: Option<serde_json::Value>,
+}
+
+#[derive(serde::Serialize)]
 struct RpcResponse {
     jsonrpc: String,
     result: Option<serde_json::Value>,
-    error: Option<String>,
+    error: Option<RpcError>,
     id: u64,
 }
 
@@ -229,12 +237,58 @@ struct MiningStore {
     is_mining: bool,
 }
 
+#[derive(Serialize, Deserialize)]
 struct ReceiptStore {
     receipts: std::collections::HashMap<String, serde_json::Value>,
 }
 
+impl ReceiptStore {
+    fn load_from_disk(path: &str) -> Self {
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(store) = serde_json::from_reader::<_, ReceiptStore>(file) {
+                return store;
+            }
+        }
+        ReceiptStore { receipts: std::collections::HashMap::new() }
+    }
+
+    fn save_to_disk(&self, path: &str) {
+        // Write atomically via temp file + rename
+        if let Ok(tmp) = tempfile::NamedTempFile::new() {
+            if serde_json::to_writer_pretty(&tmp, self).is_ok() {
+                let _ = tmp.persist(path);
+            }
+        }
+    }
+
+    fn clear_stale(&mut self, valid_hashes: &std::collections::HashSet<String>) {
+        self.receipts.retain(|k, _| valid_hashes.contains(k));
+    }
+}
+
+#[derive(Serialize, Deserialize)]
 struct Mempool {
     pending_txs: Vec<QuantumTransaction>,
+    next_nonce: std::collections::HashMap<String, u64>,
+}
+
+impl Mempool {
+    fn load_from_disk(path: &str) -> Self {
+        if let Ok(file) = std::fs::File::open(path) {
+            if let Ok(store) = serde_json::from_reader::<_, Mempool>(file) {
+                return store;
+            }
+        }
+        Mempool { pending_txs: Vec::new(), next_nonce: std::collections::HashMap::new() }
+    }
+
+    fn save_to_disk(&self, path: &str) {
+        if let Ok(tmp) = tempfile::NamedTempFile::new() {
+            if serde_json::to_writer_pretty(&tmp, self).is_ok() {
+                let _ = tmp.persist(path);
+            }
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
@@ -275,6 +329,7 @@ struct MessageStore {
 }
 
 const MAX_PACKET: usize = 32 * 1024;
+const MIN_FEE_WEI: u128 = 1; // minimal fee requirement
 
 // Define Quantum Transaction structure for deserialization
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
@@ -304,12 +359,9 @@ async fn main() {
     let keypair = MlDsa65::generate_keypair().unwrap();
     println!("Node Identity (ML-DSA-65 Public Key size: {} bytes)", keypair.public_key.len());
 
-    // Derive Address: SHA3-256(PublicKey)[0..20] -> Hex
-    let mut hasher = Sha3_256::new();
-    hasher.update(&keypair.public_key);
-    let result = hasher.finalize();
-    let address = hex::encode(&result[0..20]); // Ethereum-style 20-byte address
-    println!("Miner Address: 0x{}", address);
+    // Derive Address: keccak256(pk)[0..20] with 0x prefix
+    let address = derive_address(&keypair.public_key);
+    println!("Miner Address: {}", address);
 
     let (p2p_tx, mut p2p_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let p2p_port: u16 = env::var("PO8_P2P_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8834);
@@ -348,6 +400,7 @@ async fn main() {
             .map(|s| s.trim().to_string())
             .collect()
     );
+    let peers_rpc = peers.clone();
 
     // Cover traffic loop (best-effort, encrypted noise)
     {
@@ -374,9 +427,14 @@ async fn main() {
     }
 
     // Initialize Stores
-    let mut consensus_engine = ConsensusEngine::new();
-    // Register self as validator (Genesis validator)
-    consensus_engine.add_validator(keypair.public_key.clone(), 100);
+    let mut consensus_engine = ConsensusEngine::load_from_disk("po8_chain.json").unwrap_or_else(|_| {
+        let mut eng = ConsensusEngine::new();
+        eng
+    });
+    // Register self as validator (Genesis validator) if not present
+    if !consensus_engine.validators.contains_key(&address) {
+        consensus_engine.add_validator(keypair.public_key.clone(), 100);
+    }
     
     let engine = Arc::new(Mutex::new(consensus_engine));
     
@@ -388,16 +446,16 @@ async fn main() {
 
     // Mint initial funds to miner for testing
     // Check if miner already has balance, otherwise mint
-    if let Ok(bal) = evm_engine.get_balance(format!("0x{}", address)) {
+    if let Ok(bal) = evm_engine.get_balance(address.clone()) {
         if bal == 0 {
-             if let Err(e) = evm_engine.mint(format!("0x{}", address), 1000_000_000_000_000_000_000) { // 1000 ETH/PO8
+             if let Err(e) = evm_engine.mint(address.clone(), 1000_000_000_000_000_000_000) { // 1000 ETH/PO8
                  eprintln!("Failed to mint genesis funds: {}", e);
              } else {
                  let _ = evm_engine.save_to_disk("po8_evm_db.json");
              }
         }
     } else {
-         if let Err(e) = evm_engine.mint(format!("0x{}", address), 1000_000_000_000_000_000_000) { // 1000 ETH/PO8
+         if let Err(e) = evm_engine.mint(address.clone(), 1000_000_000_000_000_000_000) { // 1000 ETH/PO8
              eprintln!("Failed to mint genesis funds: {}", e);
          } else {
              let _ = evm_engine.save_to_disk("po8_evm_db.json");
@@ -414,19 +472,37 @@ async fn main() {
         is_mining: true, // Auto-start mining
     }));
 
-    let receipt_store = Arc::new(Mutex::new(ReceiptStore {
-        receipts: std::collections::HashMap::new(),
-    }));
+    let receipt_store = Arc::new(Mutex::new(ReceiptStore::load_from_disk("po8_receipts.json")));
 
-    let mempool = Arc::new(Mutex::new(Mempool {
-        pending_txs: Vec::new(),
-    }));
+    let mempool = Arc::new(Mutex::new(Mempool::load_from_disk("po8_mempool.json")));
 
     let message_store = Arc::new(Mutex::new(MessageStore {
         inbox: HashMap::new(),
         seen: HashSet::new(),
         rate_window: HashMap::new(),
     }));
+
+    // Clean receipts for chain continuity
+    {
+        let engine_lock = engine.lock().unwrap();
+        let mut r_lock = receipt_store.lock().unwrap();
+        let mut valid = std::collections::HashSet::new();
+        for blk in &engine_lock.chain {
+            for raw_tx in &blk.txs {
+                if let Ok(qtx) = serde_json::from_slice::<QuantumTransaction>(raw_tx) {
+                    let mut h = Sha3_256::new();
+                    h.update(qtx.sender_pk.as_bytes());
+                    h.update(qtx.recipient.as_bytes());
+                    h.update(qtx.amount.as_bytes());
+                    h.update(qtx.nonce.to_be_bytes());
+                    h.update(qtx.signature.as_bytes());
+                    valid.insert(format!("0x{}", hex::encode(h.finalize())));
+                }
+            }
+        }
+        r_lock.clear_stale(&valid);
+        r_lock.save_to_disk("po8_receipts.json");
+    }
 
     let engine_filter = {
         let engine = engine.clone();
@@ -496,6 +572,10 @@ async fn main() {
                 id: req.id,
             };
 
+            let make_err = |code: i32, msg: String| -> Option<RpcError> {
+                Some(RpcError { code, message: msg, data: None })
+            };
+
             match req.method.as_str() {
                 "net_version" => {
                     response.result = Some(serde_json::json!(network.chain_id()));
@@ -503,8 +583,24 @@ async fn main() {
                 "eth_chainId" => {
                     response.result = Some(serde_json::json!(format!("0x{:x}", network.chain_id())));
                 },
+                "eth_gasPrice" => {
+                    response.result = Some(serde_json::json!("0x1"));
+                },
+                "eth_getTransactionCount" => {
+                    let addr = req.params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
+                    let m_lock = mempool.lock().unwrap();
+                    let next = m_lock.next_nonce.get(&addr).copied().unwrap_or(0);
+                    response.result = Some(serde_json::json!(format!("0x{:x}", next)));
+                },
+                "eth_getCode" => {
+                    let addr = req.params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
+                    let vm_lock = vm.lock().unwrap();
+                    match vm_lock.get_code(addr) {
+                        Ok(code) => response.result = Some(serde_json::json!(format!("0x{}", hex::encode(code)))),
+                        Err(e) => response.error = make_err(-32000, e),
+                    }
+                },
                 "eth_call" => {
-                    // Params: [{to, from, data, value}, block]
                     if let Some(call_obj) = req.params.get(0).and_then(|v| v.as_object()) {
                          let to = call_obj.get("to").and_then(|v| v.as_str()).unwrap_or("0x").to_string();
                          let from = call_obj.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
@@ -522,14 +618,13 @@ async fn main() {
                          let mut lock = vm.lock().unwrap();
                          match lock.call(from, to, value_wei, data) {
                              Ok(res) => response.result = Some(serde_json::json!(format!("0x{}", res))),
-                             Err(e) => response.error = Some(e),
+                             Err(e) => response.error = make_err(-32000, e),
                          }
                     } else {
-                        response.error = Some("Invalid params for eth_call".to_string());
+                        response.error = make_err(-32602, "Invalid params for eth_call".to_string());
                     }
                 },
                 "eth_estimateGas" => {
-                     // Params: [{to, from, data, value}, block]
                      if let Some(call_obj) = req.params.get(0).and_then(|v| v.as_object()) {
                          let to = call_obj.get("to").and_then(|v| v.as_str()).unwrap_or("0x").to_string();
                          let from = call_obj.get("from").and_then(|v| v.as_str()).unwrap_or("0x0000000000000000000000000000000000000000").to_string();
@@ -547,18 +642,17 @@ async fn main() {
                          let mut lock = vm.lock().unwrap();
                          match lock.estimate_gas(from, to, value_wei, data) {
                              Ok(gas) => response.result = Some(serde_json::json!(format!("0x{:x}", gas))),
-                             Err(e) => response.error = Some(e),
+                             Err(e) => response.error = make_err(-32000, e),
                          }
                      } else {
-                         response.result = Some(serde_json::json!("0x5208")); // Fallback to 21000
+                         response.result = Some(serde_json::json!("0x5208"));
                      }
                 },
                 "get_block_count" | "eth_blockNumber" => {
                     let lock = engine.lock().unwrap();
-                    response.result = Some(serde_json::json!(lock.chain.len()));
+                    response.result = Some(serde_json::json!(format!("0x{:x}", lock.chain.len())));
                 },
                 "get_balance" | "eth_getBalance" => {
-                    // If address param provided, use it, else dummy default
                     let addr = if let Some(a) = req.params.get(0).and_then(|v| v.as_str()) {
                         a.to_string()
                     } else {
@@ -567,8 +661,8 @@ async fn main() {
 
                     let lock = vm.lock().unwrap();
                     match lock.get_balance(addr) {
-                        Ok(bal) => response.result = Some(serde_json::json!(format!("0x{:x}", bal))), // Hex for eth_getBalance
-                        Err(e) => response.error = Some(e),
+                        Ok(bal) => response.result = Some(serde_json::json!(format!("0x{:x}", bal))),
+                        Err(e) => response.error = make_err(-32000, e),
                     }
                 },
                 "get_mix_identity" => {
@@ -588,7 +682,7 @@ async fn main() {
                         let ack_for = obj.get("ack_for").and_then(|v| v.as_str()).map(|s| s.to_string());
 
                         if recipient.is_empty() || sender_pk_hex.is_empty() || sig_hex.is_empty() || payload_b64.is_empty() {
-                            response.error = Some("Invalid params".to_string());
+                            response.error = make_err(-32602, "Invalid params".to_string());
                         } else {
                             if let (Ok(pk_bytes), Ok(sig_bytes), Ok(payload_bytes)) = (
                                 hex::decode(&sender_pk_hex),
@@ -596,27 +690,28 @@ async fn main() {
                                 general_purpose::STANDARD.decode(&payload_b64)
                             ) {
                                 if payload_bytes.len() > MAX_PACKET {
-                                    response.error = Some("Payload too large".to_string());
+                                    response.error = make_err(-32000, "Payload too large".to_string());
                                 } else {
                                     let mut msg_bytes = recipient.as_bytes().to_vec();
                                     msg_bytes.extend_from_slice(&payload_bytes);
                                     if let Ok(valid) = MlDsa65::verify(&msg_bytes, &sig_bytes, &pk_bytes) {
                                         if valid {
                                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-                                            let expiry = now + ttl.min(900); // cap TTL
+                                            let expiry = now + ttl.min(900);
                                             let id = format!("{}:{}", sender_pk_hex, nonce);
 
                                             let mut lock = messages.lock().unwrap();
 
-                                            // rate limit: 30 msgs per 60s window
+                                            let duplicate = lock.seen.contains(&id);
                                             let entry = lock.rate_window.entry(sender_pk_hex.clone()).or_insert((now, 0));
                                             if now.saturating_sub(entry.0) >= 60 {
                                                 entry.0 = now;
                                                 entry.1 = 0;
                                             }
+
                                             if entry.1 > 30 {
-                                                response.error = Some("Rate limited".to_string());
-                                            } else if lock.seen.contains(&id) {
+                                                response.error = make_err(-32000, "Rate limited".to_string());
+                                            } else if duplicate {
                                                 response.result = Some(serde_json::json!("duplicate"));
                                             } else {
                                                 entry.1 += 1;
@@ -627,27 +722,26 @@ async fn main() {
                                                 let ack_for_relay = ack_for.clone();
 
                                                 let envelope = MessageEnvelope {
-                                                    sender_pk: sender_pk_hex,
-                                                    payload_b64,
+                                                    sender_pk: sender_pk_hex.clone(),
+                                                    payload_b64: payload_b64.clone(),
                                                     timestamp: now,
                                                     nonce,
                                                     expiry,
-                                                    kind,
-                                                    ack_for,
+                                                    kind: kind.clone(),
+                                                    ack_for: ack_for.clone(),
                                                 };
                                                 let inbox = lock.inbox.entry(recipient.clone()).or_default();
                                                 if inbox.len() > 200 {
-                                                    inbox.remove(0); // drop oldest
+                                                    inbox.remove(0);
                                                 }
                                                 inbox.push(envelope);
                                                 response.result = Some(serde_json::json!("queued"));
 
-                                                // Wrap in onion path and forward (best-effort)
-                                                if !peers.is_empty() {
+                                                if !peers_rpc.is_empty() {
                                                     let relay = RelayPacket {
                                                         recipient,
-                                                        sender_pk: sender_pk_hex,
-                                                        signature: sig_hex,
+                                                        sender_pk: sender_pk_for_relay,
+                                                        signature: sig_hex.clone(),
                                                         payload: payload_for_relay,
                                                         nonce,
                                                         ttl,
@@ -655,7 +749,7 @@ async fn main() {
                                                         ack_for: ack_for_relay,
                                                     };
                                                     if let Ok(relay_bytes) = serde_json::to_vec(&relay) {
-                                                        let path = build_path(&peers);
+                                                        let path = build_path(&peers_rpc);
                                                         let checksum = {
                                                             let mut hasher = Sha3_256::new();
                                                             hasher.update(&relay_bytes);
@@ -669,7 +763,6 @@ async fn main() {
                                                         };
                                                         if let Ok(bytes) = serde_json::to_vec(&onion) {
                                                             if let Some(pkt) = pad_packet(&bytes) {
-                                                                // send to first hop
                                                                 let next = &onion.path[0];
                                                                 forward_to_peer(next, pkt, p2p_server.clone());
                                                             }
@@ -678,18 +771,18 @@ async fn main() {
                                                 }
                                             }
                                         } else {
-                                            response.error = Some("Invalid signature".to_string());
+                                            response.error = make_err(-32000, "Invalid signature".to_string());
                                         }
                                     } else {
-                                        response.error = Some("Signature verification error".to_string());
+                                        response.error = make_err(-32000, "Signature verification error".to_string());
                                     }
                                 }
                             } else {
-                                response.error = Some("Decode error".to_string());
+                                response.error = make_err(-32000, "Decode error".to_string());
                             }
                         }
                     } else {
-                        response.error = Some("Invalid params".to_string());
+                        response.error = make_err(-32602, "Invalid params".to_string());
                     }
                 },
                 "mix_poll" => {
@@ -699,7 +792,7 @@ async fn main() {
                         let sig_hex = obj.get("signature").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
                         if recipient.is_empty() || pk_hex.is_empty() || sig_hex.is_empty() {
-                            response.error = Some("Invalid params".to_string());
+                            response.error = make_err(-32602, "Invalid params".to_string());
                         } else {
                             if let (Ok(pk_bytes), Ok(sig_bytes)) = (hex::decode(&pk_hex), hex::decode(&sig_hex)) {
                                 let mut msg_bytes = b"poll:".to_vec();
@@ -713,17 +806,17 @@ async fn main() {
                                         msgs.retain(|m| m.expiry >= now);
                                         response.result = Some(serde_json::to_value(msgs).unwrap_or(serde_json::Value::Null));
                                     } else {
-                                        response.error = Some("Invalid signature".to_string());
+                                        response.error = make_err(-32000, "Invalid signature".to_string());
                                     }
                                 } else {
-                                    response.error = Some("Signature verification error".to_string());
+                                    response.error = make_err(-32000, "Signature verification error".to_string());
                                 }
                             } else {
-                                response.error = Some("Decode error".to_string());
+                                response.error = make_err(-32000, "Decode error".to_string());
                             }
                         }
                     } else {
-                        response.error = Some("Invalid params".to_string());
+                        response.error = make_err(-32602, "Invalid params".to_string());
                     }
                 },
                 "get_history" => {
@@ -755,7 +848,7 @@ async fn main() {
                     response.result = Some(serde_json::json!({
                         "network_hashrate": "50.5 MH/s",
                         "difficulty": "0x12345",
-                        "peer_count": 8, // Mocked for now, could hook into P2P module
+                        "peer_count": 8,
                         "block_height": lock.chain.len()
                     }));
                 },
@@ -770,15 +863,11 @@ async fn main() {
                     if let Some(height) = req.params.get(0).and_then(|v| v.as_u64()) {
                         let lock = engine.lock().unwrap();
                         if let Some(block) = lock.chain.get(height as usize) {
-                            // Convert block to JSON but expand txs
                             let mut block_json = serde_json::to_value(block).unwrap();
                             if let Some(obj) = block_json.as_object_mut() {
                                 if let Some(txs_arr) = obj.get_mut("txs").and_then(|v| v.as_array_mut()) {
-                                    // txs_arr is array of array of bytes (numbers)
-                                    // Convert to QuantumTransaction objects
                                     let mut decoded_txs = Vec::new();
                                     for tx_bytes_val in txs_arr.iter() {
-                                        // tx_bytes_val is [byte, byte...]
                                         if let Some(bytes) = serde_json::from_value::<Vec<u8>>(tx_bytes_val.clone()).ok() {
                                              if let Ok(qtx) = serde_json::from_slice::<QuantumTransaction>(&bytes) {
                                                  decoded_txs.push(serde_json::to_value(qtx).unwrap());
@@ -790,10 +879,10 @@ async fn main() {
                             }
                             response.result = Some(block_json);
                         } else {
-                            response.error = Some("Block not found".to_string());
+                            response.error = make_err(-32000, "Block not found".to_string());
                         }
                     } else {
-                        response.error = Some("Invalid params".to_string());
+                        response.error = make_err(-32602, "Invalid params".to_string());
                     }
                 },
                 "get_fee_estimates" => {
@@ -812,30 +901,98 @@ async fn main() {
                              response.result = Some(serde_json::Value::Null);
                          }
                     } else {
-                        response.error = Some("Invalid params".to_string());
+                        response.error = make_err(-32602, "Invalid params".to_string());
+                    }
+                },
+                "eth_getTransactionByHash" => {
+                    if let Some(tx_hash) = req.params.get(0).and_then(|v| v.as_str()) {
+                        let r_lock = receipts.lock().unwrap();
+                        if let Some(receipt) = r_lock.receipts.get(tx_hash) {
+                            let tx_obj = serde_json::json!({
+                                "hash": tx_hash,
+                                "blockHash": receipt.get("blockHash").cloned().unwrap_or(serde_json::Value::Null),
+                                "blockNumber": receipt.get("blockNumber").cloned().unwrap_or(serde_json::Value::Null),
+                                "transactionIndex": receipt.get("transactionIndex").cloned().unwrap_or(serde_json::Value::Null),
+                            });
+                            response.result = Some(tx_obj);
+                        } else {
+                            response.result = Some(serde_json::Value::Null);
+                        }
+                    } else {
+                        response.error = make_err(-32602, "Invalid params".to_string());
+                    }
+                },
+                "eth_getBlockByNumber" | "eth_getBlockByHash" => {
+                    if let Some(num_param) = req.params.get(0) {
+                        let (height_opt, hash_opt) = match req.method.as_str() {
+                            "eth_getBlockByNumber" => {
+                                let h = if let Some(s) = num_param.as_str() {
+                                    if s == "latest" {
+                                        None
+                                    } else if s.starts_with("0x") {
+                                        u64::from_str_radix(&s[2..], 16).ok()
+                                    } else {
+                                        s.parse::<u64>().ok()
+                                    }
+                                } else if let Some(n) = num_param.as_u64() {
+                                    Some(n)
+                                } else {
+                                    None
+                                };
+                                (h, None)
+                            },
+                            _ => {
+                                if let Some(s) = num_param.as_str() {
+                                    if s.starts_with("0x") {
+                                        let bytes = hex::decode(&s[2..]).ok();
+                                        (None, bytes)
+                                    } else {
+                                        (None, None)
+                                    }
+                                } else {
+                                    (None, None)
+                                }
+                            }
+                        };
+                        let lock = engine.lock().unwrap();
+                        let target_block = if let Some(h) = height_opt {
+                            lock.chain.get(h as usize)
+                        } else if let Some(hh) = hash_opt {
+                            lock.chain.iter().find(|b| compute_block_hash(b) == hh)
+                        } else {
+                            lock.chain.last()
+                        };
+                        if let Some(block) = target_block {
+                            let block_hash = compute_block_hash(block);
+                            let tx_hashes: Vec<String> = block.txs.iter().filter_map(|raw| {
+                                serde_json::from_slice::<QuantumTransaction>(raw).ok().map(|qtx| {
+                                    let mut h = Sha3_256::new();
+                                    h.update(qtx.sender_pk.as_bytes());
+                                    h.update(qtx.recipient.as_bytes());
+                                    h.update(qtx.amount.as_bytes());
+                                    h.update(qtx.nonce.to_be_bytes());
+                                    h.update(qtx.signature.as_bytes());
+                                    format!("0x{}", hex::encode(h.finalize()))
+                                })
+                            }).collect();
+                            response.result = Some(serde_json::json!({
+                                "number": format!("0x{:x}", block.height),
+                                "hash": format!("0x{}", hex::encode(block_hash)),
+                                "parentHash": format!("0x{}", hex::encode(&block.prev_hash)),
+                                "transactions": tx_hashes,
+                            }));
+                        } else {
+                            response.result = Some(serde_json::Value::Null);
+                        }
+                    } else {
+                        response.error = make_err(-32602, "Invalid params".to_string());
                     }
                 },
                 "faucet" => {
-                    // Params: [address, amount?]
-                    if let Some(addr) = req.params.get(0).and_then(|v| v.as_str()) {
-                         let amount_str = req.params.get(1).and_then(|v| v.as_str()).unwrap_or("1000000000000000000"); // 1 PO8 default
-                         let amount: u128 = amount_str.parse().unwrap_or(1000000000000000000);
-                         
-                         let mut vm_lock = vm.lock().unwrap();
-                         if let Err(e) = vm_lock.mint(addr.to_string(), amount) {
-                             response.error = Some(e);
-                         } else {
-                             let _ = vm_lock.save_to_disk("po8_evm_db.json");
-                             response.result = Some(serde_json::json!(format!("Minted {} wei to {}", amount, addr)));
-                         }
-                    } else {
-                        response.error = Some("Invalid params".to_string());
-                    }
+                    response.error = make_err(-32000, "Method disabled".to_string());
                 },
                 "send_transaction" => {
-                    // Expect JSON object for Quantum Transaction
                     if let Some(tx_json) = req.params.get(0) {
-                         // Check for Quantum Transaction format
                          if let Ok(qtx) = serde_json::from_value::<QuantumTransaction>(tx_json.clone()) {
                              println!("Received Quantum TX from PK: {}...", &qtx.sender_pk[0..10]);
                              
@@ -852,27 +1009,50 @@ async fn main() {
                              let pk_bytes = hex::decode(&qtx.sender_pk).unwrap_or_default();
                              let sig_bytes = hex::decode(&qtx.signature).unwrap_or_default();
                              
-                             // Reconstruct message: recipient:amount:nonce:data
                              let data_str = qtx.data.clone().unwrap_or_default();
                              let msg = format!("{}:{}:{}:{}", qtx.recipient, qtx.amount, qtx.nonce, data_str);
                              let msg_bytes = msg.as_bytes();
 
                              if let Ok(valid) = MlDsa65::verify(msg_bytes, &sig_bytes, &pk_bytes) {
                                  if valid {
-                                     println!("Quantum Signature Verified! Executing in EVM...");
-                                     
-                                     // 2. Derive Sender Address (SHA3-256(pk)[0..20])
                                      let mut hasher = Sha3_256::new();
                                      hasher.update(&pk_bytes);
                                      let hash = hasher.finalize();
                                      let sender_addr = hex::encode(&hash[0..20]);
                                      let sender_addr_fmt = format!("0x{}", sender_addr);
 
-                                     // 3. Execute in EVM (Quantum Abstraction Layer)
+                                    {
+                                        let m_lock = mempool.lock().unwrap();
+                                        let next = *m_lock.next_nonce.get(&sender_addr_fmt).unwrap_or(&0);
+                                        if qtx.nonce < next {
+                                            response.error = make_err(-32000, "Nonce too low".to_string());
+                                            return warp::reply::json(&response);
+                                        }
+                                        if qtx.nonce > next + 1000 {
+                                            response.error = make_err(-32000, "Nonce too high".to_string());
+                                            return warp::reply::json(&response);
+                                        }
+                                        if m_lock.pending_txs.iter().any(|t| t.signature == qtx.signature) {
+                                            response.result = Some(serde_json::json!("duplicate"));
+                                            return warp::reply::json(&response);
+                                        }
+                                        if m_lock.pending_txs.len() > 2000 {
+                                            response.error = make_err(-32000, "Mempool full".to_string());
+                                            return warp::reply::json(&response);
+                                        }
+                                        
+                                        // Fee/Balance Check
+                                        let parsed_amount = qtx.amount.parse::<u128>().unwrap_or(0);
+                                        let vm_lock = vm.lock().unwrap();
+                                        let balance = vm_lock.get_balance(sender_addr_fmt.clone()).unwrap_or(0);
+                                        if balance < parsed_amount + MIN_FEE_WEI {
+                                            response.error = make_err(-32000, "Insufficient funds for value + fee".to_string());
+                                            return warp::reply::json(&response);
+                                        }
+                                    }
+
                                      let amount: u128 = qtx.amount.parse().unwrap_or(0);
                                      let mut vm_lock = vm.lock().unwrap();
-                                     
-                                     // Removed auto-minting for security. Use 'faucet' RPC if funds needed.
                                      
                                      let data_bytes = hex::decode(&data_str).unwrap_or_default();
                                      
@@ -889,14 +1069,12 @@ async fn main() {
                                          Err(e) => ("0x0", e, None::<String>),
                                      };
                                      
-                                     // Save DB on success
                                      if status == "0x1" {
                                          if let Err(e) = vm_lock.save_to_disk("po8_evm_db.json") {
                                              eprintln!("Failed to save EVM DB: {}", e);
                                          }
                                      }
                                      
-                                     // Create Receipt
                                      let receipt = serde_json::json!({
                                          "transactionHash": tx_hash,
                                          "transactionIndex": "0x0",
@@ -915,31 +1093,34 @@ async fn main() {
                                      
                                      let mut r_lock = receipts.lock().unwrap();
                                      r_lock.receipts.insert(tx_hash.clone(), receipt);
+                                    r_lock.save_to_disk("po8_receipts.json");
                                      
-                                     // Add to Mempool for Block Inclusion
                                      let mut m_lock = mempool.lock().unwrap();
                                      m_lock.pending_txs.push(qtx.clone());
+                                    let entry = m_lock.next_nonce.entry(sender_addr_fmt.clone()).or_insert(qtx.nonce);
+                                    if qtx.nonce >= *entry {
+                                        *entry = qtx.nonce + 1;
+                                    }
+                                    m_lock.save_to_disk("po8_mempool.json");
                                      
                                      response.result = Some(serde_json::json!(tx_hash));
                                  } else {
-                                     response.error = Some("Invalid ML-DSA Signature".to_string());
+                                     response.error = make_err(-32000, "Invalid ML-DSA Signature".to_string());
                                  }
                              } else {
-                                 response.error = Some("Signature Verification Error".to_string());
+                                 response.error = make_err(-32000, "Signature Verification Error".to_string());
                              }
                          } else if let Some(tx_data) = tx_json.as_str() {
-                             // Fallback for deprecated string format (e.g. "send:to:amt")
-                             // We should remove this soon, but keeping for backward compat during dev transition
-                             response.error = Some("Legacy format deprecated. Use QuantumTransaction JSON.".to_string());
+                             response.error = make_err(-32602, "Legacy format deprecated. Use QuantumTransaction JSON.".to_string());
                          } else {
-                             response.error = Some("Invalid params".to_string());
+                             response.error = make_err(-32602, "Invalid params".to_string());
                          }
                     } else {
-                        response.error = Some("Invalid params".to_string());
+                        response.error = make_err(-32602, "Invalid params".to_string());
                     }
                 },
                 _ => {
-                    response.error = Some("Method not found".to_string());
+                    response.error = make_err(-32601, "Method not found".to_string());
                 }
             }
 
@@ -950,6 +1131,7 @@ async fn main() {
     let miner_engine = engine.clone();
     let miner_store = mining_store.clone();
     let miner_mempool = mempool.clone();
+    let miner_receipts = receipt_store.clone();
     let miner_key = keypair.secret_key.clone();
     
     tokio::spawn(async move {
@@ -966,16 +1148,19 @@ async fn main() {
             }
 
             // Get context for mining
-            let (prev_hash, height) = {
+            let (prev_hash, height, next_difficulty, complexity) = {
                 let lock = miner_engine.lock().unwrap();
                 let last = lock.chain.last().unwrap();
-                (last.prev_hash.clone(), last.height)
+                let prev_hash = compute_block_hash(last);
+                let next_diff = lock.compute_next_difficulty();
+                let complexity = std::env::var("PO8_COMPLEXITY").ok().and_then(|v| v.parse().ok()).unwrap_or(1024usize);
+                (prev_hash, last.height, next_diff, complexity)
             };
 
             // Run Mining (Blocking)
             let start_time = std::time::Instant::now();
             let (nonce, proof, proof_vector, iterations) = tokio::task::spawn_blocking(move || {
-                po8_miner::mine_block_mlx(&prev_hash, 1024, 8)
+                po8_miner::mine_block_mlx(&prev_hash, complexity, next_difficulty as usize)
             }).await.unwrap();
             let duration = start_time.elapsed();
 
@@ -992,19 +1177,24 @@ async fn main() {
                         txs.push(bytes);
                     }
                 }
+                m_lock.save_to_disk("po8_mempool.json");
             }
 
             {
                 let mut lock = miner_engine.lock().unwrap();
                 if lock.chain.len() as u64 == height + 1 {
                     let prev_block = lock.chain.last().unwrap();
+                    let parent_hash = compute_block_hash(prev_block);
+                    let tx_root = compute_txs_merkle(&txs);
+
                     let mut new_block = po8_consensus::Block {
                         height: prev_block.height + 1,
                         timestamp: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
-                        prev_hash: prev_block.prev_hash.clone(), 
+                        prev_hash: parent_hash, 
                         txs: txs.clone(),
+                        tx_root,
                         nonce,
-                        difficulty: 8,
+                        difficulty: next_difficulty,
                         proof: proof.to_vec(),
                         proof_vector: proof_vector,
                         signature: vec![],
@@ -1015,8 +1205,33 @@ async fn main() {
                     let block_bytes = new_block.compute_sign_bytes();
                     if let Ok(sig) = po8_crypto::MlDsa65::sign(&block_bytes, &miner_key) {
                         new_block.signature = sig;
-                        lock.add_block(new_block);
-                        println!("Chain updated. Height: {}, Txs: {}", lock.chain.len(), txs.len());
+                        if lock.add_block(new_block) {
+                            let block_hash = compute_block_hash(lock.chain.last().unwrap());
+                            // Update receipts with block info
+                            {
+                                let mut r_lock = miner_receipts.lock().unwrap();
+                                for raw_tx in &txs {
+                                    if let Ok(qtx) = serde_json::from_slice::<QuantumTransaction>(raw_tx) {
+                                        let mut hasher = Sha3_256::new();
+                                        hasher.update(qtx.sender_pk.as_bytes());
+                                        hasher.update(qtx.recipient.as_bytes());
+                                        hasher.update(qtx.amount.as_bytes());
+                                        hasher.update(qtx.nonce.to_be_bytes());
+                                        hasher.update(qtx.signature.as_bytes());
+                                        let tx_hash = format!("0x{}", hex::encode(hasher.finalize()));
+                                        r_lock.receipts.insert(tx_hash.clone(), serde_json::json!({
+                                            "transactionHash": tx_hash,
+                                            "blockHash": format!("0x{}", hex::encode(&block_hash)),
+                                            "blockNumber": format!("0x{:x}", lock.chain.last().unwrap().height),
+                                            "status": "0x1"
+                                        }));
+                                    }
+                                }
+                                r_lock.save_to_disk("po8_receipts.json");
+                            }
+                            let _ = lock.save_to_disk("po8_chain.json");
+                            println!("Chain updated. Height: {}, Txs: {}", lock.chain.len(), txs.len());
+                        }
                     }
                 }
             }

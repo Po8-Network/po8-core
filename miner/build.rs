@@ -1,6 +1,14 @@
 use std::path::PathBuf;
 
 fn main() {
+    // Only build MLX bridge when the `mlx` feature is enabled.
+    if std::env::var("CARGO_FEATURE_MLX").is_err() {
+        println!("cargo:warning=Skipping MLX bridge build (feature `mlx` not enabled).");
+        // Silence unexpected cfg warnings for downstream
+        println!("cargo::rustc-check-cfg=cfg(po8_skip_mlx)");
+        return;
+    }
+
     if std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default() == "macos" {
         let mut build = cc::Build::new();
         build.cpp(true)

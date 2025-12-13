@@ -8,3 +8,5 @@ hex = "0.4.3"
 po8-crypto = { path = "../crypto" }
 serde = { version = "1.0", features = ["derive"] }
 sha3 = "0.10.8"
+tempfile = "3.10"
+serde_json = "1.0"
