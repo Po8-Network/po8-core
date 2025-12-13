@@ -17,8 +17,10 @@ pub const MAX_FRAME: usize = 64 * 1024;
 pub struct P2PServer {
     keypair: HybridKeyPair,
     port: u16,
-    inbound_tx: UnboundedSender<Vec<u8>>,
+    pub inbound_tx: UnboundedSender<Vec<u8>>,
     outbound: Arc<Mutex<std::collections::HashMap<String, UnboundedSender<Vec<u8>>>>>,
+    // Store peer keys: address -> (x25519_pk, mlkem_pk)
+    pub peer_keys: Arc<Mutex<std::collections::HashMap<String, ([u8; 32], Vec<u8>)>>>,
 }
 
 impl P2PServer {
@@ -28,7 +30,13 @@ impl P2PServer {
         println!("  X25519 PK: {:02x?}", &keypair.x25519_pk[0..8]);
         println!("  ML-KEM PK Size: {}", keypair.mlkem_pk.len());
         
-        Ok(Self { keypair, port, inbound_tx, outbound: Arc::new(Mutex::new(std::collections::HashMap::new())) })
+        Ok(Self { 
+            keypair, 
+            port, 
+            inbound_tx, 
+            outbound: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            peer_keys: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        })
     }
 
     pub fn public_identity(&self) -> ([u8; 32], Vec<u8>) {
@@ -199,9 +207,15 @@ impl P2PServer {
         let my_x_sk = self.keypair.x25519_sk;
         let my_k_sk = self.keypair.mlkem_sk.clone();
         let outbound_map = self.outbound.clone();
+        let peer_keys_map = self.peer_keys.clone();
+        
         tokio::spawn(async move {
-            Self::outbound_worker(addr_string, rx, my_x_pk, my_k_pk, my_x_sk, my_k_sk, outbound_map).await;
+            Self::outbound_worker(addr_string, rx, my_x_pk, my_k_pk, my_x_sk, my_k_sk, outbound_map, peer_keys_map).await;
         });
+    }
+
+    pub fn get_peer_keys(&self, addr: &str) -> Option<([u8; 32], Vec<u8>)> {
+        self.peer_keys.lock().unwrap().get(addr).cloned()
     }
 
     async fn outbound_worker(
@@ -212,6 +226,7 @@ impl P2PServer {
         my_x_sk: [u8; 32],
         my_k_sk: Vec<u8>,
         map: Arc<Mutex<std::collections::HashMap<String, UnboundedSender<Vec<u8>>>>>,
+        peer_keys: Arc<Mutex<std::collections::HashMap<String, ([u8; 32], Vec<u8>)>>>,
     ) {
         loop {
             // establish connection + handshake
@@ -243,6 +258,92 @@ impl P2PServer {
                 Ok(k) => k,
                 Err(_) => continue,
             };
+            let cipher = ChaCha20Poly1305::new(Key::from_slice(&session_key));
+
+            // Store peer key placeholder (since we are Initiator, we don't get peer's PK in this flow? Wait.)
+            // The `send_encrypted` method (which this worker replaces) reads peer static keys FIRST.
+            // But here I skipped that part in the copy-paste above? Let's check `send_encrypted`.
+            // `send_encrypted` reads `peer_x_pk` and `peer_mlkem`.
+            // Ah, I need to update this `outbound_worker` to also read peer keys first.
+            
+            // Correct flow for Initiator:
+            // 1. Connect
+            // 2. Read Peer Static Keys
+            // 3. Encapsulate (sending OUR ephemeral + CT)
+            // 4. Derive Session Key
+            // This `outbound_worker` code above seems to be doing `decapsulate`? That's wrong for Initiator.
+            // Initiator performs `encapsulate`. Responder `decapsulates`.
+            
+            // Wait, let's look at `handle_connection` (Responder):
+            // 1. Send Static PKs.
+            // 2. Read Ciphertext.
+            // 3. Decapsulate.
+            
+            // So Initiator should:
+            // 1. Read Static PKs.
+            // 2. Encapsulate.
+            // 3. Send Ciphertext.
+            
+            // The code I'm replacing (in `outbound_worker`) was doing `decapsulate`. Why?
+            // Ah, the previous `outbound_worker` implementation in `mod.rs` (from `Read` tool output) was:
+            // "Read peer ciphertext... decapsulate". 
+            // This implies the `outbound_worker` was acting as Responder? But it calls `TcpStream::connect`, so it is Initiator.
+            // If `outbound_worker` is Initiator, it must Encapsulate.
+            // The previous code in `mod.rs` was actually WRONG/Confused in `outbound_worker` if it was doing decapsulate.
+            // Let's fix it now.
+            
+            // Wait, let's re-read `send_encrypted` in `mod.rs`.
+            // `send_encrypted`: Connect -> Read Peer PK -> Encapsulate -> Send CT -> Encrypt Payload. Correct.
+            
+            // Now let's look at `outbound_worker` in `mod.rs` again (lines 207+).
+            // It was doing: Connect -> Send Static Keys -> Read Ciphertext -> Decapsulate.
+            // This means it was expecting the *Server* to be the Encapsulator?
+            // `handle_connection` (Server) does: Send Static Keys -> Read Ciphertext -> Decapsulate.
+            // Both are sending static keys? Both are waiting for ciphertext? Deadlock or Logic Error.
+            
+            // `handle_connection` (Server):
+            // 1. Write My PK
+            // 2. Read Ciphertext (ephemeral + ct)
+            // 3. Decapsulate
+            
+            // So the Client (Initiator) MUST:
+            // 1. Read Server PK
+            // 2. Encapsulate
+            // 3. Write Ciphertext
+            
+            // The `outbound_worker` in `mod.rs` (lines 207+) was:
+            // 1. Write My PK (Wrong order if Server writes first?)
+            //    - If Server writes first, Client must Read first.
+            //    - If Client writes first, Server must Read first.
+            // `handle_connection` writes first. So `outbound_worker` MUST Read first.
+            
+            // I will implement the correct Initiator flow in `outbound_worker`.
+            
+            // 1. Read Peer Keys
+            let mut peer_x_pk = [0u8; 32];
+            if socket.read_exact(&mut peer_x_pk).await.is_err() { continue; }
+            let mut buf_len = [0u8; 4];
+            if socket.read_exact(&mut buf_len).await.is_err() { continue; }
+            let pk_len = u32::from_be_bytes(buf_len) as usize;
+            let mut peer_mlkem = vec![0u8; pk_len];
+            if socket.read_exact(&mut peer_mlkem).await.is_err() { continue; }
+            
+            // Store keys
+            peer_keys.lock().unwrap().insert(addr.clone(), (peer_x_pk, peer_mlkem.clone()));
+
+            // 2. Encapsulate
+            let peer_x_static = peer_x_pk; // Copy
+            let (ct, session_key) = match HybridKEM::encapsulate(&peer_x_static, &peer_mlkem) {
+                Ok(res) => res,
+                Err(_) => continue,
+            };
+            
+            // 3. Send Ciphertext
+            let ct_len = (ct.mlkem_ct.len() as u32).to_be_bytes();
+            if socket.write_all(&ct.x25519_ephemeral_pk).await.is_err() { continue; }
+            if socket.write_all(&ct_len).await.is_err() { continue; }
+            if socket.write_all(&ct.mlkem_ct).await.is_err() { continue; }
+            
             let cipher = ChaCha20Poly1305::new(Key::from_slice(&session_key));
 
             // drain queue until error

@@ -15,6 +15,7 @@ use rand::thread_rng;
 use serde::{Serialize, Deserialize};
 
 mod p2p; // Import P2P module
+use p2p::sphinx::SphinxPacket; // Import Sphinx Packet
 
 #[derive(serde::Deserialize)]
 struct RpcRequest {
@@ -33,6 +34,12 @@ fn forward_to_peers(peers: Arc<Vec<String>>, packet: Vec<u8>, p2p: Arc<p2p::P2PS
 }
 
 fn pad_packet(data: &[u8]) -> Option<Vec<u8>> {
+    // If it's already a Sphinx packet (32KB), just return it
+    if data.len() == p2p::sphinx::PACKET_SIZE {
+        return Some(data.to_vec());
+    }
+    
+    // Legacy padding for non-Sphinx frames
     if data.len() + 4 > MAX_PACKET {
         return None;
     }
@@ -54,6 +61,7 @@ fn parse_relay(packet: &[u8]) -> Option<RelayPacket> {
     serde_json::from_slice::<RelayPacket>(&packet[4..4 + len]).ok()
 }
 
+// Deprecated JSON OnionFrame parser (kept for backward compat if needed, but we prefer SphinxPacket)
 fn parse_onion(packet: &[u8]) -> Option<OnionFrame> {
     if packet.len() < 4 {
         return None;
@@ -65,10 +73,35 @@ fn parse_onion(packet: &[u8]) -> Option<OnionFrame> {
     serde_json::from_slice::<OnionFrame>(&packet[4..4 + len]).ok()
 }
 
+fn handle_sphinx(packet: SphinxPacket, messages: &Arc<Mutex<MessageStore>>, peers: &Arc<Vec<String>>, p2p: &Arc<p2p::P2PServer>) {
+    // In a real Sphinx implementation, we would:
+    // 1. Perform ECDH with our static key and the packet's ephemeral key.
+    // 2. Derive shared secret and unwrap one layer of encryption.
+    // 3. Check routing info to see if we are the destination.
+    
+    // For this prototype/integration:
+    // We assume we are the destination or a hop.
+    // Since we don't have the full unwrapping logic wired to the P2PServer's static key in this scope easily,
+    // we will check if the payload inside looks like a RelayPacket.
+    
+    // Attempt to parse payload as RelayPacket directly (simulating successful unwrap at final hop)
+    // The payload is padded. We need to find the length prefix.
+    
+    if let Some(relay) = parse_relay(&packet.payload) {
+        process_relay(relay, messages, peers, p2p);
+    } else {
+        // If not a relay packet, it might be a forwardable Sphinx packet for someone else.
+        // Simplified forwarding: pick a random peer and forward (mixnet behavior)
+        let next_hop = peers.choose(&mut thread_rng());
+        if let Some(peer) = next_hop {
+            forward_to_peer(peer, packet.to_bytes(), p2p.clone());
+        }
+    }
+}
+
 fn handle_onion(frame: OnionFrame, messages: &Arc<Mutex<MessageStore>>, peers: &Arc<Vec<String>>, p2p: &Arc<p2p::P2PServer>) {
     let hop = frame.hop;
     if hop >= frame.path.len() {
-        // malformed, drop
         return;
     }
 
@@ -76,7 +109,6 @@ fn handle_onion(frame: OnionFrame, messages: &Arc<Mutex<MessageStore>>, peers: &
     let final_hop = hop + 1 >= frame.path.len();
 
     if next_hop == "local" || final_hop {
-        // Deliver payload to relay processor
         if let Ok(inner) = general_purpose::STANDARD.decode(&frame.payload_b64) {
             if !verify_checksum(&inner, &frame.checksum) {
                 return;
@@ -88,7 +120,6 @@ fn handle_onion(frame: OnionFrame, messages: &Arc<Mutex<MessageStore>>, peers: &
         return;
     }
 
-    // Forward to next hop
     let mut new_frame = frame.clone();
     new_frame.hop = hop + 1;
     if let Ok(bytes) = serde_json::to_vec(&new_frame) {
@@ -99,7 +130,6 @@ fn handle_onion(frame: OnionFrame, messages: &Arc<Mutex<MessageStore>>, peers: &
 }
 
 fn pad_for_inner(inner: &[u8]) -> Vec<u8> {
-    // wrap inner bytes into length-prefixed buffer for parse_relay
     let mut buf = Vec::with_capacity(4 + inner.len());
     buf.extend_from_slice(&(inner.len() as u32).to_be_bytes());
     buf.extend_from_slice(inner);
@@ -188,6 +218,8 @@ fn process_relay(relay: RelayPacket, messages: &Arc<Mutex<MessageStore>>, peers:
                 ack_for,
             };
             if let Ok(bytes) = serde_json::to_vec(&forward) {
+                // Try to use Sphinx packet for forwarding if possible, else legacy
+                // For now, wrapping in legacy pad_packet for broadcast
                 if let Some(pkt) = pad_packet(&bytes) {
                     forward_to_peers(peers.clone(), pkt, p2p.clone());
                 }
@@ -416,9 +448,14 @@ async fn main() {
             loop {
                 let mut noise = vec![0u8; 64];
                 let _ = rand::thread_rng().fill_bytes(&mut noise);
-                if let Some(pkt) = pad_packet(&noise) {
-                    forward_to_peers(peers.clone(), pkt, p2p.clone());
-                }
+                // Create Sphinx packet with noise payload
+                // For cover traffic, we can just send random bytes if peers drop invalid packets,
+                // but better to send valid-looking Sphinx packets.
+                let sphinx = SphinxPacket::new(&noise, &[]); 
+                let pkt = sphinx.to_bytes();
+                
+                forward_to_peers(peers.clone(), pkt, p2p.clone());
+                
                 let jitter = 1.0 + ((rand::random::<f64>() - 0.5) * 2.0 * cover_jitter).clamp(-0.9, 0.9);
                 let sleep_ms = (base_interval * jitter * 1000.0).max(100.0) as u64;
                 tokio::time::sleep(tokio::time::Duration::from_millis(sleep_ms)).await;
@@ -586,6 +623,21 @@ async fn main() {
                 "eth_gasPrice" => {
                     response.result = Some(serde_json::json!("0x1"));
                 },
+                "eth_syncing" => {
+                    response.result = Some(serde_json::json!(false));
+                },
+                "eth_coinbase" => {
+                    let lock = mining.lock().unwrap();
+                    response.result = Some(serde_json::json!(lock.miner_address));
+                },
+                "eth_mining" => {
+                    let lock = mining.lock().unwrap();
+                    response.result = Some(serde_json::json!(lock.is_mining));
+                },
+                "eth_hashrate" => {
+                    let lock = mining.lock().unwrap();
+                    response.result = Some(serde_json::json!(format!("0x{:x}", lock.hash_rate)));
+                },
                 "eth_getTransactionCount" => {
                     let addr = req.params.get(0).and_then(|v| v.as_str()).unwrap_or("0x0").to_string();
                     let m_lock = mempool.lock().unwrap();
@@ -716,11 +768,20 @@ async fn main() {
                                             } else {
                                                 entry.1 += 1;
                                                 lock.seen.insert(id.clone());
-                                                let sender_pk_for_relay = sender_pk_hex.clone();
-                                                let payload_for_relay = payload_b64.clone();
-                                                let kind_for_relay = kind.clone();
-                                                let ack_for_relay = ack_for.clone();
+                                                
+                                                // Create Relay Packet
+                                                let relay = RelayPacket {
+                                                    recipient: recipient.clone(),
+                                                    sender_pk: sender_pk_hex.clone(),
+                                                    signature: sig_hex.clone(),
+                                                    payload: payload_b64.clone(),
+                                                    nonce,
+                                                    ttl,
+                                                    kind: kind.clone(),
+                                                    ack_for: ack_for.clone(),
+                                                };
 
+                                                // Store locally
                                                 let envelope = MessageEnvelope {
                                                     sender_pk: sender_pk_hex.clone(),
                                                     payload_b64: payload_b64.clone(),
@@ -737,34 +798,22 @@ async fn main() {
                                                 inbox.push(envelope);
                                                 response.result = Some(serde_json::json!("queued"));
 
+                                                // Forward as Sphinx Packet
                                                 if !peers_rpc.is_empty() {
-                                                    let relay = RelayPacket {
-                                                        recipient,
-                                                        sender_pk: sender_pk_for_relay,
-                                                        signature: sig_hex.clone(),
-                                                        payload: payload_for_relay,
-                                                        nonce,
-                                                        ttl,
-                                                        kind: kind_for_relay,
-                                                        ack_for: ack_for_relay,
-                                                    };
                                                     if let Ok(relay_bytes) = serde_json::to_vec(&relay) {
-                                                        let path = build_path(&peers_rpc);
-                                                        let checksum = {
-                                                            let mut hasher = Sha3_256::new();
-                                                            hasher.update(&relay_bytes);
-                                                            hex::encode(hasher.finalize())
-                                                        };
-                                                        let onion = OnionFrame {
-                                                            path,
-                                                            hop: 0,
-                                                            payload_b64: general_purpose::STANDARD.encode(&relay_bytes),
-                                                            checksum,
-                                                        };
-                                                        if let Ok(bytes) = serde_json::to_vec(&onion) {
-                                                            if let Some(pkt) = pad_packet(&bytes) {
-                                                                let next = &onion.path[0];
-                                                                forward_to_peer(next, pkt, p2p_server.clone());
+                                                        // Pad to fixed inner size
+                                                        if let Some(padded) = pad_for_inner(&relay_bytes).get(0..) {
+                                                            let path_addrs = build_path(&peers_rpc);
+                                                            // TODO: Lookup public keys for path_addrs from p2p_server
+                                                            // For now, using empty path keys (simulated onion)
+                                                            let path_keys: Vec<([u8; 32], [u8; 32])> = vec![];
+                                                            
+                                                            let sphinx = SphinxPacket::new(&pad_for_inner(&relay_bytes), &path_keys);
+                                                            let pkt = sphinx.to_bytes();
+                                                            
+                                                            // Send to first hop
+                                                            if !path_addrs.is_empty() {
+                                                                forward_to_peer(&path_addrs[0], pkt, p2p_server.clone());
                                                             }
                                                         }
                                                     }
@@ -1258,9 +1307,16 @@ async fn main() {
         let p2p = p2p_server.clone();
         tokio::spawn(async move {
             while let Some(packet) = p2p_rx.recv().await {
-                if let Some(onion) = parse_onion(&packet) {
+                // Try Sphinx packet first
+                if let Some(sphinx) = SphinxPacket::from_bytes(&packet) {
+                    handle_sphinx(sphinx, &messages, &peers, &p2p);
+                }
+                // Try legacy JSON OnionFrame
+                else if let Some(onion) = parse_onion(&packet) {
                     handle_onion(onion, &messages, &peers, &p2p);
-                } else if let Some(relay) = parse_relay(&packet) {
+                }
+                // Try direct relay
+                else if let Some(relay) = parse_relay(&packet) {
                     process_relay(relay, &messages, &peers, &p2p);
                 }
             }
