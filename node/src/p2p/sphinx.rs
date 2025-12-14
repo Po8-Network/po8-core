@@ -127,3 +127,51 @@ impl SphinxPacket {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::rngs::OsRng;
+    use x25519_dalek::{StaticSecret, PublicKey};
+
+    #[test]
+    fn test_sphinx_packet_construction() {
+        let payload = vec![0x42u8; 100]; // Small payload
+        
+        // Mock path nodes
+        let node1_sk = StaticSecret::random_from_rng(OsRng);
+        let node1_pk = PublicKey::from(&node1_sk);
+        
+        let node2_sk = StaticSecret::random_from_rng(OsRng);
+        let node2_pk = PublicKey::from(&node2_sk);
+
+        let path = vec![
+            (node1_pk.to_bytes(), [0u8; 32]), 
+            (node2_pk.to_bytes(), [0u8; 32])
+        ];
+
+        let packet = SphinxPacket::new(&payload, &path);
+
+        assert_eq!(packet.version, 1);
+        assert_eq!(packet.payload.len(), PAYLOAD_SIZE);
+        
+        // Check payload is encrypted (not equal to plaintext)
+        assert_ne!(&packet.payload[0..100], &payload[..]);
+    }
+
+    #[test]
+    fn test_sphinx_serialization() {
+        let payload = vec![0xAAu8; 100];
+        let packet = SphinxPacket::new(&payload, &[]); // No hops
+        
+        let bytes = packet.to_bytes();
+        assert_eq!(bytes.len(), PACKET_SIZE);
+        
+        let deserialized = SphinxPacket::from_bytes(&bytes).expect("Deserialize failed");
+        assert_eq!(deserialized.version, packet.version);
+        assert_eq!(deserialized.ephemeral_key, packet.ephemeral_key);
+        // Payload matches exactly because we didn't encrypt it (empty path)
+        // Wait, 'new' logic might pad it.
+        assert_eq!(deserialized.payload[0..100], payload[..]);
+    }
+}

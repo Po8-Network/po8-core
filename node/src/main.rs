@@ -1038,7 +1038,25 @@ async fn main() {
                     }
                 },
                 "faucet" => {
-                    response.error = make_err(-32000, "Method disabled".to_string());
+                    if let Network::Development = network {
+                        if let Some(params) = req.params.as_slice().get(0..2) {
+                            let addr_str = params[0].as_str().unwrap_or("0x0");
+                            let amount_str = params[1].as_str().unwrap_or("0");
+                            let amount: u128 = amount_str.parse().unwrap_or(0);
+                            
+                            let mut vm_lock = vm.lock().unwrap();
+                            if let Ok(_) = vm_lock.mint(addr_str.to_string(), amount) {
+                                let _ = vm_lock.save_to_disk("po8_evm_db.json");
+                                response.result = Some(serde_json::json!(format!("Minted {} to {}", amount, addr_str)));
+                            } else {
+                                response.error = make_err(-32000, "Mint failed".to_string());
+                            }
+                        } else {
+                             response.error = make_err(-32602, "Invalid params".to_string());
+                        }
+                    } else {
+                        response.error = make_err(-32000, "Method disabled".to_string());
+                    }
                 },
                 "send_transaction" => {
                     if let Some(tx_json) = req.params.get(0) {

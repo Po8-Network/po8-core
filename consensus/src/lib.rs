@@ -709,3 +709,121 @@ impl ConsensusEngine {
         data
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use po8_crypto::{MlDsa65, QuantumSigner};
+
+    #[test]
+    fn test_tensor_proof_determinism() {
+        let prev_hash = [0u8; 32];
+        let nonce = 12345;
+        let n = 10;
+        
+        let (vec1, hash1) = compute_proof_vector_and_hash(&prev_hash, nonce, n);
+        let (vec2, hash2) = compute_proof_vector_and_hash(&prev_hash, nonce, n);
+        
+        assert_eq!(vec1, vec2);
+        assert_eq!(hash1, hash2);
+        
+        let (vec3, _) = compute_proof_vector_and_hash(&prev_hash, nonce + 1, n);
+        assert_ne!(vec1, vec3);
+    }
+
+    #[test]
+    fn test_difficulty_retarget() {
+        let mut engine = ConsensusEngine::new();
+        // Clear chain
+        engine.chain.clear();
+        
+        let base_ts = 1000000;
+        let mut prev_hash = vec![0u8; 32];
+        
+        // Add genesis
+        engine.chain.push(Block {
+            height: 0, timestamp: base_ts, prev_hash: vec![], txs: vec![], tx_root: vec![],
+            nonce: 0, difficulty: 10, proof: vec![], proof_vector: vec![], 
+            proposer_address: "".to_string(), signature: vec![], last_commit: None
+        });
+
+        // Add 10 blocks with FAST times (1 second)
+        for i in 1..=10 {
+            engine.chain.push(Block {
+                height: i, timestamp: base_ts + i * 1, // 1 sec intervals
+                prev_hash: prev_hash.clone(), txs: vec![], tx_root: vec![],
+                nonce: 0, difficulty: 10, proof: vec![], proof_vector: vec![], 
+                proposer_address: "".to_string(), signature: vec![], last_commit: None
+            });
+        }
+
+        let next = engine.compute_next_difficulty();
+        // Should increase because blocks were too fast (1s vs 30s target)
+        assert!(next > 10, "Difficulty should increase (got {})", next);
+    }
+
+    #[test]
+    fn test_verify_commit_power() {
+        let mut engine = ConsensusEngine::new();
+        let kp1 = MlDsa65::generate_keypair().unwrap();
+        let kp2 = MlDsa65::generate_keypair().unwrap();
+        let kp3 = MlDsa65::generate_keypair().unwrap();
+
+        engine.add_validator(kp1.public_key.clone(), 10);
+        engine.add_validator(kp2.public_key.clone(), 10);
+        engine.add_validator(kp3.public_key.clone(), 10);
+        // Total = 30. Threshold > 20.
+
+        let addr1 = derive_address(&kp1.public_key);
+        let addr2 = derive_address(&kp2.public_key);
+        
+        let block_hash = vec![1u8; 32];
+        
+        let mut vote1 = Vote {
+            vote_type: VoteType::Precommit, height: 1, round: 0, block_hash: block_hash.clone(),
+            timestamp: 100, validator_address: addr1.clone(), signature: vec![]
+        };
+        let msg1 = ConsensusEngine::compute_vote_sign_bytes(&vote1);
+        vote1.signature = MlDsa65::sign(&msg1, &kp1.secret_key).unwrap();
+
+        let mut vote2 = Vote {
+            vote_type: VoteType::Precommit, height: 1, round: 0, block_hash: block_hash.clone(),
+            timestamp: 100, validator_address: addr2.clone(), signature: vec![]
+        };
+        let msg2 = ConsensusEngine::compute_vote_sign_bytes(&vote2);
+        vote2.signature = MlDsa65::sign(&msg2, &kp2.secret_key).unwrap();
+
+        // 1. Single vote (10/30) -> Fail
+        let commit_weak = Commit {
+            height: 1, round: 0, block_hash: block_hash.clone(),
+            signatures: vec![vote1.clone()]
+        };
+        assert!(engine.verify_commit(&commit_weak).is_none());
+
+        // 2. Two votes (20/30) -> Fail (needs > 2/3, so > 20)
+        // Actually 2/3 of 30 is 20. We need > 20. So 21. 
+        // 20 is not strictly > 2/3 (66.6%). 20/30 is exactly 66.6%. Usually BFT is > 2/3.
+        // Let's check logic: signed_power > (total * 2 / 3)
+        // 20 > 20 is False. Correct.
+        let commit_med = Commit {
+            height: 1, round: 0, block_hash: block_hash.clone(),
+            signatures: vec![vote1.clone(), vote2.clone()]
+        };
+        assert!(engine.verify_commit(&commit_med).is_none());
+
+        // 3. Add 3rd validator (30/30) -> Pass
+        let addr3 = derive_address(&kp3.public_key);
+        let mut vote3 = Vote {
+            vote_type: VoteType::Precommit, height: 1, round: 0, block_hash: block_hash.clone(),
+            timestamp: 100, validator_address: addr3.clone(), signature: vec![]
+        };
+        let msg3 = ConsensusEngine::compute_vote_sign_bytes(&vote3);
+        vote3.signature = MlDsa65::sign(&msg3, &kp3.secret_key).unwrap();
+
+        let commit_strong = Commit {
+            height: 1, round: 0, block_hash: block_hash.clone(),
+            signatures: vec![vote1, vote2, vote3]
+        };
+        assert!(engine.verify_commit(&commit_strong).is_some());
+    }
+}
